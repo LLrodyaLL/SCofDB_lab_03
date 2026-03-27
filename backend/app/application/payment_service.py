@@ -7,6 +7,7 @@
 
 import uuid
 from typing import Optional
+import asyncio
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -59,7 +60,46 @@ class PaymentService:
             OrderAlreadyPaidError: если заказ уже оплачен
         """
         # TODO: Реализовать логику оплаты БЕЗ блокировок
-        raise NotImplementedError("TODO: Реализовать PaymentService.pay_order_unsafe")
+        async with self.session.begin():
+            result = await self.session.execute(
+                text("SELECT status FROM orders WHERE id = :order_id"),
+                {"order_id": order_id},
+            )
+            status = result.scalar_one_or_none()
+
+            if status is None:
+                raise OrderNotFoundError(order_id)
+
+            if status != "created":
+                raise OrderAlreadyPaidError(order_id)
+
+            # Специально расширяем окно race condition для демонстрации проблемы
+            await asyncio.sleep(0.2)
+
+            await self.session.execute(
+                text(
+                    """
+                    UPDATE orders
+                    SET status = 'paid'
+                    WHERE id = :order_id AND status = 'created'
+                    """
+                ),
+                {"order_id": order_id},
+            )
+
+            # ВАЖНО: намеренно не проверяем rowcount,
+            # чтобы продемонстрировать race condition
+            await self.session.execute(
+                text(
+                    """
+                    INSERT INTO order_status_history (id, order_id, status, changed_at)
+                    VALUES (:id, :order_id, 'paid', NOW())
+                    """
+                ),
+                {"id": uuid.uuid4(), "order_id": order_id},
+            )
+
+        return {"order_id": str(order_id), "status": "paid", "mode": "unsafe"}
 
     async def pay_order_safe(self, order_id: uuid.UUID) -> dict:
         """
@@ -108,7 +148,55 @@ class PaymentService:
             OrderAlreadyPaidError: если заказ уже оплачен
         """
         # TODO: Реализовать логику оплаты С блокировками
-        raise NotImplementedError("TODO: Реализовать PaymentService.pay_order_safe")
+        async with self.session.begin():
+            await self.session.execute(
+                text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            )
+
+            result = await self.session.execute(
+                text(
+                    """
+                    SELECT status
+                    FROM orders
+                    WHERE id = :order_id
+                    FOR UPDATE
+                    """
+                ),
+                {"order_id": order_id},
+            )
+            status = result.scalar_one_or_none()
+
+            if status is None:
+                raise OrderNotFoundError(order_id)
+
+            if status != "created":
+                raise OrderAlreadyPaidError(order_id)
+
+            update_result = await self.session.execute(
+                text(
+                    """
+                    UPDATE orders
+                    SET status = 'paid'
+                    WHERE id = :order_id AND status = 'created'
+                    """
+                ),
+                {"order_id": order_id},
+            )
+
+            if update_result.rowcount != 1:
+                raise OrderAlreadyPaidError(order_id)
+
+            await self.session.execute(
+                text(
+                    """
+                    INSERT INTO order_status_history (id, order_id, status, changed_at)
+                    VALUES (:id, :order_id, 'paid', NOW())
+                    """
+                ),
+                {"id": uuid.uuid4(), "order_id": order_id},
+            )
+
+        return {"order_id": str(order_id), "status": "paid", "mode": "safe"}
 
     async def get_payment_history(self, order_id: uuid.UUID) -> list[dict]:
         """
@@ -130,4 +218,27 @@ class PaymentService:
             Список словарей с записями об оплате
         """
         # TODO: Реализовать получение истории оплат
-        raise NotImplementedError("TODO: Реализовать PaymentService.get_payment_history")
+        result = await self.session.execute(
+            text(
+                """
+                SELECT id, order_id, status, changed_at
+                FROM order_status_history
+                WHERE order_id = :order_id AND status = 'paid'
+                ORDER BY changed_at
+                """
+            ),
+            {"order_id": order_id},
+        )
+
+        rows = result.mappings().all()
+
+        return [
+            {
+                "id": str(row["id"]),
+                "order_id": str(row["order_id"]),
+                "status": row["status"],
+                "changed_at": row["changed_at"],
+            }
+            for row in rows
+        ]
+    
